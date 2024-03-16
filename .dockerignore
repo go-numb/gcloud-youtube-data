@@ -1,0 +1,6 @@
+.env
+*.csv
+./frontend/*
+./frontend
+
+.env*
