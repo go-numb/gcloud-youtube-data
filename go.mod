@@ -4,6 +4,7 @@ go 1.22.0
 
 require (
 	cloud.google.com/go/storage v1.39.1
+	github.com/gocarina/gocsv v0.0.0-20231116093920-b87c2d0e983a
 	github.com/google/uuid v1.6.0
 	github.com/joho/godotenv v1.5.1
 	github.com/labstack/echo/v4 v4.11.4
