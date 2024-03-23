@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -26,15 +28,13 @@ import (
 
 const (
 	ISGCS      = true
-	BUCKETNAME = "data-sdy"
+	BUCKETNAME = "data-sdy-for-u"
 	FILEPREFIX = "youtube-data"
-	MAXRESULTS = 2
+	MAXRESULTS = 10
 )
 
 var (
 	PORT       string
-	APIKEY     = os.Getenv("APIKEY")
-	PROJECTID  = os.Getenv("PROJECTID")
 	FILEEXPIRE = time.Now().Add(24 * time.Hour)
 
 	APICOUNT = 0
@@ -60,8 +60,13 @@ func main() {
 
 	api := e.Group("/api")
 
+	// ルーティング
+	api.GET("/health", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{"message": "Hello, World!"})
+	})
 	api.GET("/youtube/channels", GetChannelsFromQuery)
 	api.GET("/youtube/comments", GetCommentsFromQuery)
+	api.GET("/youtube/video/comments", GetCommentsFromQueryId)
 
 	log.Fatal().Err(e.Start(PORT)).Msgf("Server Stopped, API access: %d", APICOUNT)
 
@@ -74,6 +79,11 @@ func GetChannelsFromQuery(c echo.Context) error {
 	q := c.QueryParam("q")
 	if q == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"message": "query is required"})
+	}
+
+	token := c.QueryParam("token")
+	if token == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "token/APIKey is required"})
 	}
 
 	// 登録者数の取得
@@ -91,7 +101,7 @@ func GetChannelsFromQuery(c echo.Context) error {
 	}
 
 	ctx := context.Background()
-	service, err := youtube.NewService(ctx, option.WithAPIKey(APIKEY))
+	service, err := youtube.NewService(ctx, option.WithAPIKey(token))
 	if err != nil {
 		log.Fatal().Msgf("Error creating YouTube client: %v, API access: %d", err, APICOUNT)
 	}
@@ -162,7 +172,7 @@ func GetChannelsFromQuery(c echo.Context) error {
 				List([]string{"id", "snippet", "statistics"}).
 				ChannelId(channelID).
 				Type("video").
-				Order("videoCount").
+				Order("viewCount").
 				MaxResults(MAXRESULTS).Do()
 			if err != nil {
 				log.Printf("error retrieving videos for channel %s: %v, API access: %d", channelID, err, APICOUNT)
@@ -297,10 +307,15 @@ func GetCommentsFromQuery(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"message": "query is required"})
 	}
 
+	token := c.QueryParam("token")
+	if token == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "token/APIKey is required"})
+	}
+
 	ctx := context.Background()
-	service, err := youtube.NewService(ctx, option.WithAPIKey(APIKEY))
+	service, err := youtube.NewService(ctx, option.WithAPIKey(token))
 	if err != nil {
-		log.Fatal().Msgf("Error creating YouTube client: %v, API access: %d", err, APICOUNT)
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": fmt.Sprintf("Error creating YouTube client: %v", err)})
 	}
 
 	searchCall := service.Search.List([]string{"id"}).Q(q).MaxResults(MAXRESULTS)
@@ -308,7 +323,7 @@ func GetCommentsFromQuery(c echo.Context) error {
 	APICOUNT++
 	searchResponse, err := searchCall.Do()
 	if err != nil {
-		log.Fatal().Msgf("Error searching videos: %v, API access: %d", err, APICOUNT)
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": fmt.Sprintf("Error searching videos: %v", err)})
 	}
 
 	var videoIds []string
@@ -332,7 +347,7 @@ func GetCommentsFromQuery(c echo.Context) error {
 			List([]string{"snippet", "contentDetails", "statistics"}).
 			Id(videoId).Do()
 		if err != nil {
-			log.Printf("Error retrieving video information: %v, API access: %d", err, APICOUNT)
+			log.Debug().Msgf("Error retrieving video information: %v, API access: %d", err, APICOUNT)
 			continue
 		}
 
@@ -345,7 +360,7 @@ func GetCommentsFromQuery(c echo.Context) error {
 			List([]string{"snippet"}).
 			VideoId(videoId).Do()
 		if err != nil {
-			log.Printf("Error retrieving comments: %v, API access: %d", err, APICOUNT)
+			log.Debug().Msgf("Error retrieving comments: %v, API access: %d", err, APICOUNT)
 			continue
 		}
 
@@ -392,7 +407,7 @@ func GetCommentsFromQuery(c echo.Context) error {
 		// ctx := context.Background()
 		client, err := storage.NewClient(ctx)
 		if err != nil {
-			log.Fatal().Msgf("Error creating client: %v, API access: %d", err, APICOUNT)
+			return c.JSON(http.StatusInternalServerError, map[string]string{"message": fmt.Sprintf("Error creating client: %v", err)})
 		}
 		defer client.Close()
 
@@ -437,6 +452,182 @@ func GetCommentsFromQuery(c echo.Context) error {
 	return c.JSON(http.StatusOK, m)
 }
 
+func GetCommentsFromQueryId(c echo.Context) error {
+	q := c.QueryParam("q")
+	if q == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "query is required"})
+	}
+
+	token := c.QueryParam("token")
+	if token == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"message": "token/APIKey is required"})
+	}
+
+	// youtube url/idからidを取得
+	// https://www.youtube.com/watch?v=xxxxxxxxxx
+	// https://youtu.be/xxxxxxxxxx
+	youtubeVodeoId := GetYoutubeVideoId(q)
+
+	ctx := context.Background()
+	service, err := youtube.NewService(ctx, option.WithAPIKey(token))
+	if err != nil {
+		log.Debug().Msgf("Error creating YouTube client: %v", err)
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": fmt.Sprintf("Error creating YouTube client: %v", err)})
+	}
+
+	uniquename := uuid.New().String()
+	objectname := fmt.Sprintf("%s-video-comment-%s-%s.csv", FILEPREFIX, youtubeVodeoId, uniquename)
+
+	// to Json
+	var rows []RowForComment
+
+	// 動画の情報とコメントの取得
+	// 動画情報の取得
+	APICOUNT++
+	videoResponse, err := service.Videos.
+		List([]string{"snippet", "contentDetails", "statistics"}).
+		Id(youtubeVodeoId).Do()
+	if err != nil {
+		log.Debug().Msgf("Error retrieving video information: %v, API access: %d", err, APICOUNT)
+		return c.JSON(http.StatusInternalServerError, map[string]string{"message": fmt.Sprintf("Error retrieving video information: %v", err)})
+	}
+
+	// 動画情報の表示
+	var (
+		video     = videoResponse.Items[0]
+		nextToken string
+	)
+
+	for {
+		// コメントの取得
+		APICOUNT++
+		commentsResponse, err := service.CommentThreads.
+			List([]string{"snippet", "replies"}).
+			MaxResults(int64(video.Statistics.CommentCount)).
+			VideoId(youtubeVodeoId).
+			PageToken(nextToken).Do()
+		if err != nil {
+			log.Debug().Msgf("Error retrieving comments: %v, API access: %d", err, APICOUNT)
+			break
+		}
+
+		id := video.Id
+		var (
+			like     uint64
+			favo     uint64
+			comments uint64
+			replay   uint64
+		)
+
+		if video.Statistics != nil {
+			like = video.Statistics.LikeCount
+			comments = video.Statistics.CommentCount
+		}
+
+		// コメントの取得
+		for _, commentThread := range commentsResponse.Items {
+			comment := commentThread.Snippet.TopLevelComment.Snippet
+			favo = uint64(comment.LikeCount)
+			replay = uint64(commentThread.Snippet.TotalReplyCount)
+
+			rows = append(rows, RowForComment{
+				VideoId:  id,
+				Like:     like,
+				Comments: comments,
+
+				Comment:   comment.TextDisplay,
+				Name:      comment.AuthorDisplayName,
+				NameId:    comment.AuthorChannelId.Value,
+				Favo:      favo,
+				Replay:    replay,
+				CreatedAt: comment.PublishedAt,
+			})
+			if commentThread.Replies == nil {
+				continue
+			}
+			if len(commentThread.Replies.Comments) > 0 {
+				// 返信の取得
+				for _, reply := range commentThread.Replies.Comments {
+					favo = uint64(reply.Snippet.LikeCount)
+					rows = append(rows, RowForComment{
+						VideoId:  id,
+						Like:     like,
+						Comments: comments,
+
+						IsReply:   true,
+						Name:      reply.Snippet.AuthorDisplayName,
+						NameId:    reply.Snippet.AuthorChannelId.Value,
+						Comment:   reply.Snippet.TextDisplay,
+						Favo:      favo,
+						Replay:    0,
+						CreatedAt: reply.Snippet.PublishedAt,
+					})
+				}
+			}
+		}
+
+		nextToken = commentsResponse.NextPageToken
+		if nextToken == "" {
+			break
+		}
+	}
+
+	log.Debug().Msgf("youtubeVodeoId: %s, API access: %d, rows: %d/%d", youtubeVodeoId, APICOUNT, len(rows), video.Statistics.CommentCount)
+
+	var m = echo.Map{
+		"q": youtubeVodeoId,
+	}
+
+	if ISGCS {
+		// GCSにファイルをアップロード
+		// ctx := context.Background()
+		client, err := storage.NewClient(ctx)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"message": fmt.Sprintf("Error creating client: %v", err)})
+		}
+		defer client.Close()
+
+		object := client.Bucket(BUCKETNAME).Object(objectname)
+
+		w := object.NewWriter(ctx)
+		defer w.Close()
+
+		w.ContentType = "text/csv"
+
+		// json to csv and write
+		csvFile, err := gocsv.MarshalBytes(rows)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"message": "Error unmarshaling bytes"})
+		}
+
+		// オブジェクトの有効期限を設定
+		w.RetentionExpirationTime = FILEEXPIRE
+		if _, err := w.Write(csvFile); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"message": fmt.Sprintf("Error writing file: %v", err)})
+		}
+
+		for i := 0; i < 10; i++ {
+			if err := w.Close(); err != nil {
+				log.Error().Msgf("Error closing writer: %v, API access: %d", err, APICOUNT)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			break
+		}
+
+		// create file link
+		attrs, err := object.Attrs(ctx)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"message": "Error getting object attrs"})
+		}
+		m["link"] = attrs.MediaLink
+	}
+
+	m["rows"] = rows
+
+	return c.JSON(http.StatusOK, m)
+}
+
 // 文字数を制限する
 func Cut(s string, n int) string {
 	if len([]rune(s)) > n {
@@ -452,6 +643,7 @@ type RowForComment struct {
 	Like     uint64 `json:"like"`
 	Comments uint64 `json:"comments"`
 
+	IsReply   bool   `json:"is_reply"`
 	Name      string `json:"name"`
 	NameId    string `json:"name_id"`
 	Comment   string `json:"comment"`
@@ -478,4 +670,23 @@ type RowForChannel struct {
 	DaysAgo          uint64    `json:"days_ago"`
 	ChannelCreatedAt time.Time `json:"channel_created_at "`
 	CreatedAt        time.Time `json:"created_at"`
+}
+
+func GetYoutubeVideoId(q string) string {
+	// https://www.youtube.com/watch?v=xxxxxxxxxx
+	// https://youtu.be/xxxxxxxxxx
+	if strings.Contains(q, "youtube.com") {
+		u, err := url.Parse(q)
+		if err != nil {
+			return ""
+		}
+		return u.Query().Get("v")
+	} else if strings.Contains(q, "youtu.be") {
+		u, err := url.Parse(q)
+		if err != nil {
+			return ""
+		}
+		return u.Path
+	}
+	return q
 }
